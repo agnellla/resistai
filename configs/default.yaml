@@ -8,7 +8,12 @@
 seed: 42
 
 data:
-  image_size: 224            # must match what the checkpoint was trained with
+  image_size: 64             # MUST match the checkpoint's training size.
+                             # Baseline v1 / Robust v1 were trained at 64
+                             # (see outputs/*/run_config.json). Feeding a
+                             # different size to these checkpoints gives
+                             # near-random output. Override per-run with
+                             # `inference.py --image_size N`.
 
 model:
   backbone: efficientnet_b0  # timm model name; must match the checkpoint

@@ -27,7 +27,7 @@ from pathlib import Path
 
 import torch
 import torchvision.transforms as T
-from PIL import Image
+from PIL import Image, ImageOps
 
 from src.model import build_model
 from src.transforms import IMAGENET_MEAN, IMAGENET_STD
@@ -61,6 +61,9 @@ def main():
                         help="path to a trained state_dict checkpoint")
     parser.add_argument("--config", default="configs/default.yaml",
                         help="YAML config for model settings (backbone, image size, ...)")
+    parser.add_argument("--image_size", type=int, default=None,
+                        help="override config image size; MUST match the "
+                             "checkpoint's training size (64 for Baseline/Robust v1)")
     parser.add_argument("--out", default="predictions.json",
                         help="output JSON file path")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"],
@@ -69,7 +72,8 @@ def main():
 
     cfg = load_config(args.config)
     device = get_device(args.device)
-    image_size = cfg["data"]["image_size"]
+    image_size = args.image_size if args.image_size is not None else cfg["data"]["image_size"]
+    print(f"[inference] image_size = {image_size}  (must match the checkpoint's training size)")
 
     # Build the model and load trained weights.
     model = build_model(
@@ -89,7 +93,9 @@ def main():
     results = []
     for path in paths:
         try:
-            img = Image.open(path).convert("RGB")
+            img = Image.open(path)
+            img = ImageOps.exif_transpose(img)   # respect camera rotation
+            img = img.convert("RGB")
         except Exception as e:
             # Unreadable file -> default to real (0) and keep going.
             print(f"[inference] could not read {path}: {e}")

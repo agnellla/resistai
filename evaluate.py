@@ -58,8 +58,10 @@ def parse_args():
                    help="where to write metrics.json + confusion_matrix.csv "
                         "(default: the checkpoint's folder)")
 
-    p.add_argument("--image_size", type=int, default=224,
-                   help="resize images to this square size (must match training)")
+    p.add_argument("--image_size", type=int, default=64,
+                   help="resize images to this square size; MUST match the "
+                        "checkpoint's training size (64 for Baseline/Robust v1). "
+                        "All committed v1 results were produced with 64.")
     p.add_argument("--batch_size", type=int, default=64,
                    help="images per batch")
     p.add_argument("--max_samples", type=int, default=None,

@@ -208,7 +208,7 @@ with st.expander("Live demo - run both models on your own image (optional)"):
     else:
         try:
             import torch
-            from PIL import Image
+            from PIL import Image, ImageOps
             from src.model import build_model
             from src.transforms import build_eval_transform
             from scripts.evaluate_robustness import CONDITIONS, apply_condition
@@ -230,7 +230,7 @@ with st.expander("Live demo - run both models on your own image (optional)"):
             cname, plabel, pvalue = CONDITIONS[cond_labels.index(cond_pick)]
 
             if up is not None:
-                img = Image.open(up).convert("RGB")
+                img = ImageOps.exif_transpose(Image.open(up)).convert("RGB")
                 shown = apply_condition(img, cname, pvalue, base_seed=42, idx=0)
                 cc1, cc2 = st.columns([1, 2])
                 cc1.image(shown, caption=f"input after: {cond_pick}", width=200)
