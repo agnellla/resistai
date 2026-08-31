@@ -1,0 +1,17 @@
+# ResistAI - config file
+# ----------------------
+# NOTE: train.py and evaluate.py are driven entirely by command-line flags and
+# do NOT read this file. Only inference.py reads it, and only the `model` +
+# `data.image_size` values below. It exists so the judges can run inference.py
+# without passing a long argument list.
+
+seed: 42
+
+data:
+  image_size: 224            # must match what the checkpoint was trained with
+
+model:
+  backbone: efficientnet_b0  # timm model name; must match the checkpoint
+  pretrained: false          # inference loads weights from the checkpoint, not ImageNet
+  num_classes: 2             # class 0 = real, class 1 = AI-generated
+  dropout: 0.2
