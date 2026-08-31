@@ -26,9 +26,14 @@ reports/_scratch/
 .vscode/
 
 # Dataset images - not committed. But DO commit the split manifests
-# (data/splits/*.csv) so every experiment uses the identical partition.
+# (data/splits/*.csv, data/splits_v2/*.csv + its json) so every experiment
+# uses the identical partition.
 data/cifake/
+data/v2_images/
 data/*.zip
 !data/splits/
 !data/splits/*.csv
+!data/splits_v2/
+!data/splits_v2/*.csv
+!data/splits_v2/*.json
 outputs/
