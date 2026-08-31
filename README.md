@@ -155,6 +155,44 @@ Per-epoch metrics -> `<output_dir>/metrics.csv`
 Eval metrics -> `<checkpoint_dir>/metrics.json` + `confusion_matrix.csv`
 Exact settings used -> `<output_dir>/run_config.json`
 
+## Experiment results: Baseline v1 vs Robust v1
+
+Full analysis in [`reports/robustness_analysis.md`](reports/robustness_analysis.md);
+figures in `reports/figures/`; per-condition numbers in
+`reports/benchmark_results.csv`. All figures come from the **same 10,000-image
+held-out test set** (`data/splits/test.csv`), scored by
+`scripts/evaluate_robustness.py` under 17 conditions (clean + 16 transformed, every
+image transformed at a fixed severity).
+
+**The honest result: Robust v1 is NOT universally more accurate.** It trades a
+small amount of clean-image performance for a large improvement under realistic
+degradation.
+
+| | Baseline v1 | Robust v1 | Δ |
+|---|---|---|---|
+| **Clean** accuracy / F1 / ROC-AUC | 0.915 / 0.915 / 0.969 | 0.897 / 0.899 / 0.957 | **-1.8 / -1.6 / -1.2 pp** |
+| **Transformed** (mean of 16) accuracy | 0.754 | **0.833** | **+7.9 pp** |
+| **Transformed** (mean of 16) F1 | 0.676 | **0.821** | **+14.5 pp** |
+| **Transformed** (mean of 16) ROC-AUC | 0.836 | **0.905** | **+6.9 pp** |
+| Accuracy retention under corruption | ~0.82 | **~0.93** | |
+
+Largest gains (where the baseline collapses to predicting "real"):
+
+| Condition | Baseline acc | Robust acc | Gain |
+|---|---|---|---|
+| blur sigma 1.0 | 0.569 | 0.819 | **+25.0 pp** (F1 +55.6) |
+| resize 0.5x | 0.554 | 0.803 | **+24.9 pp** (F1 +55.8) |
+| blur sigma 2.0 | 0.531 | 0.728 | +19.7 pp |
+| resize 0.25x | 0.524 | 0.721 | +19.7 pp |
+| centre crop 80% | 0.664 | 0.833 | +16.9 pp |
+| noise sigma 0.10 | 0.533 | 0.660 | +12.7 pp |
+
+Where Robust v1 is **worse** (all mild, <= ~2 pp): clean, all four JPEG levels,
+light noise (sigma 0.02), and all three colour-jitter conditions - transforms that
+barely change the image and that the baseline already handles.
+
+Rebuild the figures with `python reports/make_figures.py`.
+
 ## Google Colab (Tesla T4 GPU)
 
 Runtime -> Change runtime type -> **T4 GPU**, then:
@@ -191,22 +229,35 @@ import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
 from google.colab import files; files.download('outputs/baseline_full/best_model.pt')
 ```
 
-## Note on 32x32 images vs 224x224 input
+## Limitations
 
-CIFAKE images are 32x32; EfficientNet-B0 expects ~224x224, so `transforms.py`
-upscales them. This is fine for a working baseline (the pipeline, metrics and
-Colab port all exercise correctly) but the model sees blurry, detail-poor input,
-so the accuracy ceiling is lower than on a native-resolution AIGC dataset.
-`--image_size` is configurable if you want to train at 64 or 96 to iterate
-faster; keep train and evaluate `--image_size` equal.
+- **CIFAKE is 32x32.** Images are upscaled to 64 px for the model, which never
+  sees native high-frequency detail; absolute accuracy would differ on a
+  native-resolution dataset. (`--image_size` is configurable; keep train and
+  evaluate equal.)
+- **Synthetic fakes only** - Stable Diffusion v1.4. These results do **not** prove
+  generalisation to other generators (SDXL, Midjourney, FLUX, GANs, ...).
+- **Simulated corruptions.** The six transform families approximate
+  screenshot / re-upload / compression pipelines; they are not the full space of
+  real-world distribution shift.
+- **Small v1 budget** - 3 epochs, 8,000 training images. Both models were still
+  improving (validation loss decreasing at epoch 3); longer training would shift
+  both curves and could change the size of the trade-off.
+- **The clean-vs-robust trade-off is real** - Robust v1 is measurably worse on
+  clean and lightly-processed images. This is not a free lunch.
+- **Single seed, single run** per model; no confidence intervals. Per-condition
+  false-positive / false-negative counts in the analysis are reconstructed from
+  accuracy + F1 on the fixed 5,000/5,000 test balance, not separately logged.
 
 ## Status
 
 - [x] Repo structure + configs
 - [x] Frozen 80/10/10 split (`data/splits/*.csv`)
-- [x] Baseline v1 trained + evaluated (`outputs/baseline_v1/`, not committed)
-- [x] Transformation-aware training implemented (`--augment`, `src/augmentations.py`)
-- [ ] Robust v1 trained + compared against Baseline v1
-- [ ] Robustness + FP/FN report
-- [ ] Streamlit demo
+- [x] Baseline v1 trained + evaluated
+- [x] Transformation-aware training (`--augment`, `src/augmentations.py`)
+- [x] Robust v1 trained + evaluated
+- [x] Full robustness benchmark, 17 conditions (`scripts/evaluate_robustness.py`)
+- [x] Analysis + figures (`reports/robustness_analysis.md`, `reports/figures/`)
+- [x] Streamlit demo (`dashboard/app.py`)
 - [ ] Demo video
+- [ ] v2 experiments (longer training, larger `--image_size`, more transforms)

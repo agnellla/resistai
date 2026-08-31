@@ -11,13 +11,14 @@ data/ai/*
 !data/real/.gitkeep
 !data/ai/.gitkeep
 
-# Model weights and generated outputs
+# Model weights
 checkpoints/*.pt
 checkpoints/*.pth
-reports/*.png
-reports/*.csv
-reports/*.json
 predictions.json
+
+# reports/ holds committed deliverables (analysis, benchmark CSVs, figures).
+# Only ad-hoc scratch is ignored:
+reports/_scratch/
 
 # OS / editor noise
 .DS_Store
