@@ -85,8 +85,18 @@ def build_report(args, paths):
 
     a_v2 = read_json(paths["A"])                       # evaluate.py metrics.json
     c_v2 = read_json(paths["C"])                       # evaluate_realworld.py
-    c_v1b = read_json(paths.get("C_v1_baseline"))      # V1 baseline on the SAME C set
-    c_v1r = read_json(paths.get("C_v1_robust"))        # V1 robust on the SAME C set
+
+    def _paired_v1(p):
+        """Return the metrics dict, or None if the file is an 'unavailable' marker
+        (missing original V1 checkpoint) - never invents numbers."""
+        d = read_json(p)
+        if not d or d.get("status") == "unavailable_original_v1_checkpoint" or "overall" not in d:
+            return None
+        return d
+    c_v1b = _paired_v1(paths.get("C_v1_baseline"))     # V1 baseline on the SAME C set (or None)
+    c_v1r = _paired_v1(paths.get("C_v1_robust"))       # V1 robust on the SAME C set (or None)
+    v1_paired_status = ("available" if (c_v1b and c_v1r)
+                        else "unavailable_original_v1_checkpoint")
     probe = read_json(paths["probes"])                 # shortcut_probes.py
     lp = read_json(paths["lp_metrics"])                # linear probe
     v2cfg = read_json(paths["v2_cfg"])
@@ -111,7 +121,12 @@ def build_report(args, paths):
             "frozen_v1": {f"{k[0]}:{k[1]}": v for k, v in frozen.items()},
             "v2_rows": {f"{k[0]}:{k[1]}": v for k, v in b_rows.items()},
         },
-        "C_realworld": {"v2": c_v2, "v1_baseline": c_v1b, "v1_robust": c_v1r},
+        "C_realworld": {
+            "v2": c_v2,
+            "v1_paired_status": v1_paired_status,
+            "v1_baseline": c_v1b if c_v1b else {"status": "unavailable_original_v1_checkpoint"},
+            "v1_robust": c_v1r if c_v1r else {"status": "unavailable_original_v1_checkpoint"},
+        },
         "shortcut_probes": probe,
     }
     Path(paths["results_json"]).write_text(json.dumps(results, indent=2, default=str))
@@ -171,13 +186,13 @@ def build_report(args, paths):
     # 4. results table - A / B summary / C
     w("\n## 4. Results (A, B, C kept separate)\n")
     w("### A - CIFAKE clean test (`data/splits/test.csv`, frozen)\n")
-    w("| Model | Accuracy | F1 | ROC-AUC |")
-    w("|---|---|---|---|")
-    w("| Baseline V1 | 0.915 | 0.915 | 0.969 |")
-    w("| Robust V1 | 0.897 | 0.899 | 0.957 |")
+    w("| Model | Accuracy | F1 | ROC-AUC | source |")
+    w("|---|---|---|---|---|")
+    w("| Baseline V1 | 0.915 | 0.915 | 0.969 | historical frozen (reports/benchmark_results.csv) |")
+    w("| Robust V1 | 0.897 | 0.899 | 0.957 | historical frozen (reports/benchmark_results.csv) |")
     if a_v2:
         w(f"| **V2** | {a_v2.get('accuracy'):.3f} | {a_v2.get('f1'):.3f} | "
-          f"{a_v2.get('roc_auc'):.3f} |")
+          f"{a_v2.get('roc_auc'):.3f} | newly measured this run |")
         cm = a_v2.get("confusion_matrix", {})
         w(f"\nV2 confusion matrix: TN={cm.get('true_real_pred_real')} "
           f"FP={cm.get('true_real_pred_ai')} FN={cm.get('true_ai_pred_real')} "
@@ -205,15 +220,23 @@ def build_report(args, paths):
           f"{v2a} | {fr.get('baseline_f1','-')} | {fr.get('robust_f1','-')} | {v2f} |")
 
     w("\n### C - real-world / unseen-generator holdout (PRIMARY objective)\n")
+    w("_These are **newly measured V2** numbers on the held-out set. They are NOT the "
+      "historical V1 benchmark (that is section B / `reports/benchmark_results.csv`)._\n")
     if c_v2:
         o = c_v2["overall"]
-        w("Paired on the SAME held-out set (V1 checkpoints run at image_size 64, V2 at "
-          f"{(v2cfg or {}).get('image_size', '224')}):\n")
+        if v1_paired_status != "available":
+            w("> **Paired V1-on-this-set: `unavailable_original_v1_checkpoint`.** "
+              "`outputs/baseline_v1/best_model.pt` and `outputs/robust_v1/best_model.pt` "
+              "are not present in this environment and were not retrained or fabricated, so "
+              "V1 could not be scored on this exact set. Historical V1 numbers remain in "
+              "section B (frozen benchmark). Only V2 is shown below.\n")
+        w("Paired on the SAME held-out set (V1 checkpoints, when present, run at image_size 64; "
+          f"V2 at {(v2cfg or {}).get('image_size', '224')}):\n")
         w("| Model | n | acc | F1 | ROC-AUC | mean P(AI) | FP-rate REAL | TP-rate AI |")
         w("|---|---|---|---|---|---|---|---|")
         for nm, cc in (("Baseline V1", c_v1b), ("Robust V1", c_v1r), ("**V2**", c_v2)):
             if not cc:
-                w(f"| {nm} | (missing) | | | | | | |"); continue
+                w(f"| {nm} | _unavailable_original_v1_checkpoint_ | | | | | | |"); continue
             x = cc["overall"]
             w(f"| {nm} | {x['n']} | {fmt(x['accuracy'])} | {fmt(x['f1'])} | "
               f"{fmt(x['roc_auc'])} | {fmt(x['mean_p_ai'])} | "
@@ -248,6 +271,11 @@ def build_report(args, paths):
     w("\n## 5. Shortcut sensitivity - V1 vs V2\n")
     if probe:
         mods = probe.get("models", {})
+        if "baseline_v1" not in mods and "robust_v1" not in mods:
+            w("> V1 columns are **`unavailable_original_v1_checkpoint`** (no V1 `best_model.pt` "
+              "in this environment; not retrained). Only newly measured V2 curves are shown. "
+              "The documented V1 grain-sweep collapse (~0.92 -> ~0.13) is from the earlier "
+              "forensic audit in `reports/`, not recomputed here.\n")
         w("### CIFAKE quick probe - grain sweep on FAKE (want P(AI) to STAY HIGH)\n")
         w("| Model | s0 | s4 | s8 | s12 | s16 | s24 | drop 0->24 |")
         w("|---|---|---|---|---|---|---|---|")
@@ -314,11 +342,15 @@ def build_report(args, paths):
                      + ", ".join(f"{k} {v['false_positive_rate']:.3f}"
                                  for k, v in c_v2.get('by_real_source', {}).items()) + ".")
         else:
-            q.append(f"**1. Did V2 improve real-world detection vs V1?** V2 on C: accuracy "
-                     f"{o['accuracy']:.3f}, F1 {o['f1']:.3f}, ROC-AUC {fmt(o['roc_auc'])}. "
-                     f"(V1-on-C outputs missing - re-run step 9b/9c.)")
-            q.append(f"**2. Did V2 reduce false positives on genuine HD photographs?** V2 FP-rate on "
-                     f"REAL in C = {fmt(o['false_positive_rate_on_real'])}; by source: "
+            q.append(f"**1. Did V2 improve real-world detection vs V1?** Paired comparison is "
+                     f"**`unavailable_original_v1_checkpoint`** - the V1 `best_model.pt` files are "
+                     f"absent and were not retrained or fabricated. Newly measured V2 on C: accuracy "
+                     f"{o['accuracy']:.3f}, F1 {o['f1']:.3f}, ROC-AUC {fmt(o['roc_auc'])}. Historical "
+                     f"V1 behaviour is characterised only by the frozen CIFAKE benchmark (section B) "
+                     f"and the shortcut probes (section 5, V1 columns also unavailable this run).")
+            q.append(f"**2. Did V2 reduce false positives on genuine HD photographs?** No V1 baseline "
+                     f"on this set (see Q1). Newly measured V2 FP-rate on REAL in C = "
+                     f"{fmt(o['false_positive_rate_on_real'])}; by source: "
                      + ", ".join(f"{k} {v['false_positive_rate']:.3f}"
                                  for k, v in c_v2.get('by_real_source', {}).items()) + ".")
         srcs = c_v2.get("by_real_source", {})
@@ -343,12 +375,19 @@ def build_report(args, paths):
                 return m.get("cifake_quick_probe", {}).get("fake", {}).get("grain_p_ai_drop_0_to_24")
             return m.get("ai_images_grain_blur_downsample", {}).get("grain_p_ai_drop_0_to_24")
         b1, v2d = gdrop("baseline_v1", "cifake"), gdrop("v2", "cifake")
-        line = ("**5. Did the grain/blur/resolution shortcut get weaker?** CIFAKE grain-sweep "
-                f"P(AI) drop (0->24): Baseline V1 {b1:+.3f}" if b1 is not None else
-                "**5.** baseline probe missing")
-        if v2d is not None:
-            line += f", V2 {v2d:+.3f}  (delta {delta(v2d, b1) if b1 is not None else 'n/a'}; "
-            line += "smaller magnitude = shortcut reduced)."
+        if b1 is not None:
+            line = ("**5. Did the grain/blur/resolution shortcut get weaker?** CIFAKE grain-sweep "
+                    f"P(AI) drop (0->24): Baseline V1 {b1:+.3f}")
+            if v2d is not None:
+                line += (f", V2 {v2d:+.3f}  (delta {delta(v2d, b1)}; "
+                         "smaller magnitude = shortcut reduced).")
+        else:
+            line = ("**5. Did the grain/blur/resolution shortcut get weaker?** V1 shortcut probe "
+                    "columns are `unavailable_original_v1_checkpoint` (no V1 `best_model.pt`). "
+                    + (f"Newly measured V2 CIFAKE grain-sweep P(AI) drop (0->24) = {v2d:+.3f}; "
+                       "the documented V1 baseline for this probe was ~+0.76 (from the prior "
+                       "audit in reports/, not recomputed here)." if v2d is not None
+                       else "V2 probe value also missing."))
         # downsample rise
         ds1 = mods.get("baseline_v1", {}).get("real_hd_downsample_and_grain", {}).get(
             "downsample_p_ai_rise_1024_to_64")
@@ -375,9 +414,14 @@ def build_report(args, paths):
 
     w("\n\n".join(q))
     w("\n\n## 7. Verification\n")
-    w("- frozen artifacts untouched (checked by `scripts/run_v2_experiment.py` preflight): "
-      "`outputs/baseline_v1/`, `outputs/robust_v1/`, `data/splits/*.csv`, "
-      "`reports/benchmark_results.csv`, `scripts/evaluate_robustness.py`")
+    w(f"- **historical V1 checkpoints**: paired V1 real-world evaluation status = "
+      f"**`{v1_paired_status}`**. When unavailable, `outputs/baseline_v1/best_model.pt` and "
+      f"`outputs/robust_v1/best_model.pt` were absent; they were **not retrained or fabricated** "
+      f"and no V1 metric was invented. Historical V1 numbers used in this report come only from "
+      f"the frozen `reports/benchmark_results.csv` (sections A and B).")
+    w("- frozen artifacts untouched (checked by `scripts/run_v2_experiment.py` preflight + "
+      "end-of-run re-hash): `data/splits/*.csv`, `reports/benchmark_results.csv`, "
+      "`scripts/evaluate_robustness.py` (and the V1 checkpoints/metrics when present).")
     w(f"- V2 split leakage report: `data/splits_v2/leakage_report.json` "
       f"({'OK' if (leak or {}).get('ok') else 'see file'})")
     w("- B was run at image_size 224 with both `evaluate_robustness.py` checkpoint slots "
@@ -448,17 +492,29 @@ def main():
         args.resume = False
 
     # ---- preflight: frozen artifacts present + record hashes ----
-    for p in (FROZEN_BENCHMARK, FROZEN_TEST_CSV, V1_BASELINE, V1_ROBUST):
+    # The historical V1 CHECKPOINTS may be absent (not in git). Their absence is
+    # non-fatal: only the paired V1-on-realworld-test computation is skipped.
+    # Everything that is genuinely frozen and required stays fail-loud.
+    for p in (FROZEN_BENCHMARK, FROZEN_TEST_CSV):
         if not p.exists():
             raise SystemExit(f"missing frozen artifact {p}")
+    v1_ckpts_present = V1_BASELINE.exists() and V1_ROBUST.exists()
+    if not v1_ckpts_present:
+        print("[preflight] original V1 checkpoints not found "
+              f"({V1_BASELINE}, {V1_ROBUST}) - the paired V1 real-world evaluation and the "
+              "V1 columns of the shortcut probe will be recorded as "
+              "'unavailable_original_v1_checkpoint'. Historical V1 benchmark numbers "
+              "(reports/benchmark_results.csv) are still used. No V1 metrics are invented.")
     import hashlib
+    _hash_targets = [FROZEN_BENCHMARK, FROZEN_TEST_CSV,
+                     ROOT / "data/splits/train.csv", ROOT / "data/splits/val.csv",
+                     ROOT / "scripts/evaluate_robustness.py"]
+    if v1_ckpts_present:
+        _hash_targets += [V1_BASELINE, V1_ROBUST,
+                          ROOT / "outputs/baseline_v1/metrics.json",
+                          ROOT / "outputs/robust_v1/metrics.json"]
     frozen_hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
-                     for p in (FROZEN_BENCHMARK, FROZEN_TEST_CSV,
-                               ROOT / "data/splits/train.csv", ROOT / "data/splits/val.csv",
-                               ROOT / "scripts/evaluate_robustness.py",
-                               V1_BASELINE, V1_ROBUST,
-                               ROOT / "outputs/baseline_v1/metrics.json",
-                               ROOT / "outputs/robust_v1/metrics.json")}
+                     for p in _hash_targets if p.exists()}
 
     out_v2 = ROOT / "outputs" / "v2"
     out_lp = ROOT / "outputs" / "v2_linear_probe"
@@ -597,24 +653,37 @@ def main():
           "--num_workers", args.num_workers, "--output_dir", str(out_B)]
          + (["--limit", args.bench_limit] if args.bench_limit else []))
 
-    # 9. C - real-world holdout: V2, and V1 baseline/robust for a paired comparison
+    # 9. C - real-world holdout: V2 always; paired V1 baseline/robust only if the
+    # original checkpoints exist (their absence is non-fatal - see preflight).
     step(9, paths["C"],
          [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(v2_ckpt),
           "--test_csv", args.realworld_csv, "--image_size", args.image_size,
           "--device", args.device, "--out", str(paths["C"])])
-    step("9b", paths["C_v1_baseline"],
-         [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_BASELINE),
-          "--test_csv", args.realworld_csv, "--image_size", 64,
-          "--device", args.device, "--out", str(paths["C_v1_baseline"])])
-    step("9c", paths["C_v1_robust"],
-         [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_ROBUST),
-          "--test_csv", args.realworld_csv, "--image_size", 64,
-          "--device", args.device, "--out", str(paths["C_v1_robust"])])
+    if v1_ckpts_present:
+        step("9b", paths["C_v1_baseline"],
+             [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_BASELINE),
+              "--test_csv", args.realworld_csv, "--image_size", 64,
+              "--device", args.device, "--out", str(paths["C_v1_baseline"])])
+        step("9c", paths["C_v1_robust"],
+             [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_ROBUST),
+              "--test_csv", args.realworld_csv, "--image_size", 64,
+              "--device", args.device, "--out", str(paths["C_v1_robust"])])
+    else:
+        for pth in (paths["C_v1_baseline"], paths["C_v1_robust"]):
+            Path(pth).parent.mkdir(parents=True, exist_ok=True)
+            Path(pth).write_text(json.dumps(
+                {"status": "unavailable_original_v1_checkpoint",
+                 "reason": "outputs/baseline_v1|robust_v1/best_model.pt not present in this "
+                           "environment; not retrained or fabricated.",
+                 "test_csv": args.realworld_csv}, indent=2))
+        print("[step 9b/9c] SKIPPED - original V1 checkpoints unavailable "
+              "(recorded status 'unavailable_original_v1_checkpoint')")
 
-    # 10. shortcut probes V1 + V2
-    probe_cmd = [PY, "scripts/shortcut_probes.py", "--checkpoints",
-                 f"baseline_v1={V1_BASELINE}:64", f"robust_v1={V1_ROBUST}:64",
-                 f"v2={v2_ckpt}:{args.image_size}",
+    # 10. shortcut probes: V2 always; V1 columns only if the original checkpoints exist
+    ck = [f"v2={v2_ckpt}:{args.image_size}"]
+    if v1_ckpts_present:
+        ck = [f"baseline_v1={V1_BASELINE}:64", f"robust_v1={V1_ROBUST}:64"] + ck
+    probe_cmd = [PY, "scripts/shortcut_probes.py", "--checkpoints", *ck,
                  "--n", args.probe_n, "--device", args.device, "--out", str(paths["probes"])]
     if args.real_images:
         probe_cmd += ["--real_images", args.real_images]
@@ -633,9 +702,11 @@ def main():
                if hashlib.sha256((ROOT / k).read_bytes()).hexdigest() != v]
     if changed:
         raise SystemExit(f"FROZEN ARTIFACT CHANGED during the run: {changed} - investigate!")
-    print("[verify] V1 frozen artifacts + V1 checkpoints unchanged:")
+    print(f"[verify] frozen artifacts unchanged ({len(frozen_hashes)} hashed; V1 checkpoints "
+          f"{'included' if v1_ckpts_present else 'ABSENT - not hashable, paired V1 eval skipped'}):")
     for k in frozen_hashes:
         print(f"    ok  {k}")
+    v1tag = "metrics" if v1_ckpts_present else "status: unavailable_original_v1_checkpoint"
     expected = {
         "V2 checkpoint": out_v2 / "best_model.pt",
         "V2 run_config": out_v2 / "run_config.json",
@@ -644,8 +715,8 @@ def main():
         "A (CIFAKE clean)": paths["A"],
         "B (robustness csv)": paths["B_csv"],
         "C (realworld V2)": paths["C"],
-        "C (realworld V1 baseline)": paths["C_v1_baseline"],
-        "C (realworld V1 robust)": paths["C_v1_robust"],
+        f"C (realworld V1 baseline) [{v1tag}]": paths["C_v1_baseline"],
+        f"C (realworld V1 robust) [{v1tag}]": paths["C_v1_robust"],
         "shortcut probes": paths["probes"],
         "results json": paths["results_json"],
         "final report": paths["report_md"],
