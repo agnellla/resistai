@@ -414,7 +414,38 @@ def main():
     ap.add_argument("--sanity_images", default=None, help="dir for the one-shot sanity probe")
     ap.add_argument("--skip_train", action="store_true", help="reuse an existing outputs/v2/best_model.pt")
     ap.add_argument("--probe_n", type=int, default=64)
+    ap.add_argument("--a_max_samples", type=int, default=None,
+                    help="cap for evaluation A (smoke only; leave unset for the real run)")
+    ap.add_argument("--bench_limit", type=int, default=None,
+                    help="cap for evaluation B (smoke only; leave unset for the real run)")
+    # resumability
+    ap.add_argument("--resume", action="store_true", default=True,
+                    help="skip any step whose valid output already exists (default on)")
+    ap.add_argument("--no_resume", dest="resume", action="store_false")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore --resume and redo everything (does NOT touch frozen V1)")
+    # step 0: dataset assembly (Tiny-GenImage). If omitted, manifests must already exist.
+    ap.add_argument("--assemble", action="store_true",
+                    help="run scripts/prepare_v2_data.py --source tiny_genimage first")
+    ap.add_argument("--hf_id", default=None, help="HF dataset id for Tiny-GenImage")
+    ap.add_argument("--hf_local_dir", default=None, help="local load_from_disk path (no network)")
+    ap.add_argument("--hf_split", default="train")
+    ap.add_argument("--generator_field", default="auto")
+    ap.add_argument("--image_field", default="auto")
+    ap.add_argument("--real_names", default="real,nature,imagenet,photo,authentic")
+    ap.add_argument("--train_generators", default="SD14,SD15,BigGAN,ADM")
+    ap.add_argument("--heldout_generators", default="Midjourney,GLIDE")
+    ap.add_argument("--n_real", type=int, default=4000)
+    ap.add_argument("--ai_per_generator", type=int, default=2000, help="CEILING per train generator")
+    ap.add_argument("--heldout_count", type=int, default=2000)
+    ap.add_argument("--min_per_generator", type=int, default=1000)
+    ap.add_argument("--cifake_per_class", type=int, default=2000)
+    ap.add_argument("--c_real_holdback_frac", type=float, default=0.2)
+    ap.add_argument("--max_side", type=int, default=512)
+    ap.add_argument("--min_side", type=int, default=200)
     args = ap.parse_args()
+    if args.force:
+        args.resume = False
 
     # ---- preflight: frozen artifacts present + record hashes ----
     for p in (FROZEN_BENCHMARK, FROZEN_TEST_CSV, V1_BASELINE, V1_ROBUST):
@@ -424,7 +455,10 @@ def main():
     frozen_hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                      for p in (FROZEN_BENCHMARK, FROZEN_TEST_CSV,
                                ROOT / "data/splits/train.csv", ROOT / "data/splits/val.csv",
-                               ROOT / "scripts/evaluate_robustness.py")}
+                               ROOT / "scripts/evaluate_robustness.py",
+                               V1_BASELINE, V1_ROBUST,
+                               ROOT / "outputs/baseline_v1/metrics.json",
+                               ROOT / "outputs/robust_v1/metrics.json")}
 
     out_v2 = ROOT / "outputs" / "v2"
     out_lp = ROOT / "outputs" / "v2_linear_probe"
@@ -443,53 +477,139 @@ def main():
         "report_md": ROOT / "reports" / "v2_report.md",
     }
 
-    # 1-3. verify manifests + disjointness + held-out generator absence
-    run(1, [PY, "scripts/verify_v2_splits.py", "--splits_dir",
-            str(Path(args.train_csv).parent), "--check_files"])
+    def have(p):
+        p = Path(p)
+        return p.exists() and p.stat().st_size > 2
+
+    splits_dir = Path(args.train_csv).parent
+
+    # ---- 0. dataset assembly (Tiny-GenImage) ----
+    manifests = [splits_dir / f"{n}.csv" for n in ("train", "val", "realworld_test")]
+    if args.assemble:
+        if args.resume and all(have(m) for m in manifests) and have(splits_dir / "leakage_report.json"):
+            leak = read_json(splits_dir / "leakage_report.json")
+            if leak and leak.get("ok"):
+                print("[step 0] manifests already present and leakage_report ok - skipping assembly "
+                      "(use --force to rebuild)")
+            else:
+                raise SystemExit("[step 0] existing manifests but leakage_report not ok - "
+                                 "delete data/v2_images + data/splits_v2 and re-run with --force")
+        else:
+            if (ROOT / "data" / "v2_images").exists():
+                raise SystemExit("data/v2_images exists - remove it (rm -rf data/v2_images "
+                                 "data/splits_v2) before a fresh --assemble")
+            asm = [PY, "scripts/prepare_v2_data.py", "--source", "tiny_genimage",
+                   "--hf_split", args.hf_split, "--generator_field", args.generator_field,
+                   "--image_field", args.image_field, "--real_names", args.real_names,
+                   "--train_generators", args.train_generators,
+                   "--heldout_generators", args.heldout_generators,
+                   "--n_real", args.n_real, "--ai_per_generator", args.ai_per_generator,
+                   "--heldout_count", args.heldout_count, "--min_per_generator", args.min_per_generator,
+                   "--cifake_dir", "data/cifake", "--cifake_per_class", args.cifake_per_class,
+                   "--c_real_holdback_frac", args.c_real_holdback_frac,
+                   "--max_side", args.max_side, "--min_side", args.min_side, "--seed", args.seed]
+            if args.hf_local_dir:
+                asm += ["--hf_local_dir", args.hf_local_dir]
+            elif args.hf_id:
+                asm += ["--hf_id", args.hf_id]
+            else:
+                raise SystemExit("--assemble needs --hf_id or --hf_local_dir")
+            run(0, asm)
+    for m in manifests:
+        if not have(m):
+            raise SystemExit(f"missing manifest {m} - pass --assemble (with --hf_id/--hf_local_dir) "
+                             f"or create data/splits_v2/ first")
+
+    # ---- 1-3. independent split verification + composition preflight ----
+    run(1, [PY, "scripts/verify_v2_splits.py", "--splits_dir", str(splits_dir), "--check_files"])
+    leak = read_json(splits_dir / "leakage_report.json") or {}
+    comp = read_json(splits_dir / "composition.json") or {}
+    print("\n[preflight] V2 composition")
+    for s in comp.get("splits", []):
+        print(f"  {s['name']:16s} n={s['n']:6d}  real={s['real']:6d}  ai={s['ai']:6d}  "
+              f"generators={s['generators']}  real_sources={s['real_sources']}")
+    checks = {
+        "held-out generators absent from train+val": leak.get("ok") and not any(
+            "held-out generator" in p for p in leak.get("problems", [])),
+        "no content-hash overlap across splits": not any(
+            "hash" in p for p in leak.get("problems", [])),
+        "realworld_test has BOTH real and ai": leak.get("realworld_test_real", 0) > 0
+                                               and leak.get("realworld_test_ai", 0) > 0,
+        "every train generator >= min_per_generator": not any(
+            "min_per_generator" in p for p in leak.get("problems", [])),
+        "no duplicate image_path": not any("duplicate" in p for p in leak.get("problems", [])),
+    }
+    for k, ok in checks.items():
+        print(f"  [{'ok' if ok else 'FAIL'}] {k}")
+    if not all(checks.values()) or not leak.get("ok", False):
+        raise SystemExit(f"[preflight] scientific precondition violated: {leak.get('problems')}")
+
+    lp_ok = have(out_lp / "metrics.json")
+    v2_ok = have(out_v2 / "best_model.pt") and have(out_v2 / "metrics.json") and have(out_v2 / "run_config.json")
 
     if not args.skip_train:
-        # 4. linear probe
-        run(4, [PY, "train_v2.py", "--train_csv", args.train_csv, "--val_csv", args.val_csv,
-                "--output_dir", str(out_lp), "--linear_probe",
-                "--epochs", args.probe_epochs, "--image_size", args.image_size,
-                "--batch_size", args.batch_size, "--acq_prob", args.acq_prob,
-                "--acq_num", args.acq_num, "--device", args.device,
-                "--num_workers", args.num_workers, "--seed", args.seed]
-               + (["--robustness_aug"] if args.robustness_aug else []))
-        # 5. full fine-tune
-        run(5, [PY, "train_v2.py", "--train_csv", args.train_csv, "--val_csv", args.val_csv,
-                "--output_dir", str(out_v2), "--epochs", args.epochs,
-                "--image_size", args.image_size, "--batch_size", args.batch_size,
-                "--lr", args.lr, "--label_smoothing", args.label_smoothing,
-                "--scheduler", "cosine", "--acq_prob", args.acq_prob, "--acq_num", args.acq_num,
-                "--device", args.device, "--num_workers", args.num_workers, "--seed", args.seed]
-               + (["--robustness_aug"] if args.robustness_aug else []))
+        # 4. linear probe (resumable)
+        if args.resume and lp_ok:
+            print("[step 4] linear-probe metrics.json present - skipping (use --force)")
+        else:
+            run(4, [PY, "train_v2.py", "--train_csv", args.train_csv, "--val_csv", args.val_csv,
+                    "--output_dir", str(out_lp), "--linear_probe",
+                    "--epochs", args.probe_epochs, "--image_size", args.image_size,
+                    "--batch_size", args.batch_size, "--acq_prob", args.acq_prob,
+                    "--acq_num", args.acq_num, "--device", args.device,
+                    "--num_workers", args.num_workers, "--seed", args.seed]
+                   + (["--robustness_aug"] if args.robustness_aug else []))
+        # 5. full fine-tune (resumable)
+        if args.resume and v2_ok:
+            print("[step 5] outputs/v2/best_model.pt + metrics.json present - skipping training "
+                  "(use --force to retrain)")
+        else:
+            run(5, [PY, "train_v2.py", "--train_csv", args.train_csv, "--val_csv", args.val_csv,
+                    "--output_dir", str(out_v2), "--epochs", args.epochs,
+                    "--image_size", args.image_size, "--batch_size", args.batch_size,
+                    "--lr", args.lr, "--label_smoothing", args.label_smoothing,
+                    "--scheduler", "cosine", "--acq_prob", args.acq_prob, "--acq_num", args.acq_num,
+                    "--device", args.device, "--num_workers", args.num_workers, "--seed", args.seed]
+                   + (["--robustness_aug"] if args.robustness_aug else []))
     v2_ckpt = out_v2 / "best_model.pt"
     if not v2_ckpt.exists():
         raise SystemExit(f"{v2_ckpt} not found - training did not produce a checkpoint")
 
+    def step(tag, out_check, cmd):
+        if args.resume and have(out_check):
+            print(f"[step {tag}] {out_check} present - skipping (use --force)")
+        else:
+            run(tag, cmd)
+
     # 7. A - CIFAKE clean (frozen test.csv)
-    run(7, [PY, "evaluate.py", "--checkpoint", str(v2_ckpt), "--test_csv", str(FROZEN_TEST_CSV),
-            "--image_size", args.image_size, "--output_dir", str(out_v2 / "cifake_clean_A"),
-            "--device", args.device, "--num_workers", args.num_workers])
+    step(7, paths["A"],
+         [PY, "evaluate.py", "--checkpoint", str(v2_ckpt), "--test_csv", str(FROZEN_TEST_CSV),
+          "--image_size", args.image_size, "--output_dir", str(out_v2 / "cifake_clean_A"),
+          "--device", args.device, "--num_workers", args.num_workers]
+         + (["--max_samples", args.a_max_samples] if args.a_max_samples else []))
 
     # 8. B - frozen robustness benchmark; both slots = V2, read "robust" rows
-    run(8, [PY, "scripts/evaluate_robustness.py",
-            "--baseline_checkpoint", str(v2_ckpt), "--robust_checkpoint", str(v2_ckpt),
-            "--test_csv", str(FROZEN_TEST_CSV), "--image_size", args.image_size,
-            "--batch_size", args.batch_size, "--device", args.device,
-            "--num_workers", args.num_workers, "--output_dir", str(out_B)])
+    step(8, paths["B_csv"],
+         [PY, "scripts/evaluate_robustness.py",
+          "--baseline_checkpoint", str(v2_ckpt), "--robust_checkpoint", str(v2_ckpt),
+          "--test_csv", str(FROZEN_TEST_CSV), "--image_size", args.image_size,
+          "--batch_size", args.batch_size, "--device", args.device,
+          "--num_workers", args.num_workers, "--output_dir", str(out_B)]
+         + (["--limit", args.bench_limit] if args.bench_limit else []))
 
     # 9. C - real-world holdout: V2, and V1 baseline/robust for a paired comparison
-    run(9, [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(v2_ckpt),
-            "--test_csv", args.realworld_csv, "--image_size", args.image_size,
-            "--device", args.device, "--out", str(paths["C"])])
-    run("9b", [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_BASELINE),
-              "--test_csv", args.realworld_csv, "--image_size", 64,
-              "--device", args.device, "--out", str(paths["C_v1_baseline"])])
-    run("9c", [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_ROBUST),
-              "--test_csv", args.realworld_csv, "--image_size", 64,
-              "--device", args.device, "--out", str(paths["C_v1_robust"])])
+    step(9, paths["C"],
+         [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(v2_ckpt),
+          "--test_csv", args.realworld_csv, "--image_size", args.image_size,
+          "--device", args.device, "--out", str(paths["C"])])
+    step("9b", paths["C_v1_baseline"],
+         [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_BASELINE),
+          "--test_csv", args.realworld_csv, "--image_size", 64,
+          "--device", args.device, "--out", str(paths["C_v1_baseline"])])
+    step("9c", paths["C_v1_robust"],
+         [PY, "scripts/evaluate_realworld.py", "--checkpoint", str(V1_ROBUST),
+          "--test_csv", args.realworld_csv, "--image_size", 64,
+          "--device", args.device, "--out", str(paths["C_v1_robust"])])
 
     # 10. shortcut probes V1 + V2
     probe_cmd = [PY, "scripts/shortcut_probes.py", "--checkpoints",
@@ -502,17 +622,42 @@ def main():
         probe_cmd += ["--ai_images", args.ai_images]
     if args.sanity_images:
         probe_cmd += ["--images", args.sanity_images]
-    run(10, probe_cmd)
+    step(10, paths["probes"], probe_cmd)
 
     # 11-13. compare + save + report
     build_report(args, paths)
 
-    # frozen-artifact tamper check
+    # ---- 12. independent end-of-run verification ----
+    print("\n" + "=" * 78 + "\n[verify] end-of-run checks\n" + "=" * 78)
     changed = [k for k, v in frozen_hashes.items()
                if hashlib.sha256((ROOT / k).read_bytes()).hexdigest() != v]
     if changed:
         raise SystemExit(f"FROZEN ARTIFACT CHANGED during the run: {changed} - investigate!")
-    print("\n[verify] frozen artifacts unchanged:", list(frozen_hashes))
+    print("[verify] V1 frozen artifacts + V1 checkpoints unchanged:")
+    for k in frozen_hashes:
+        print(f"    ok  {k}")
+    expected = {
+        "V2 checkpoint": out_v2 / "best_model.pt",
+        "V2 run_config": out_v2 / "run_config.json",
+        "V2 metrics": out_v2 / "metrics.json",
+        "linear-probe metrics": out_lp / "metrics.json",
+        "A (CIFAKE clean)": paths["A"],
+        "B (robustness csv)": paths["B_csv"],
+        "C (realworld V2)": paths["C"],
+        "C (realworld V1 baseline)": paths["C_v1_baseline"],
+        "C (realworld V1 robust)": paths["C_v1_robust"],
+        "shortcut probes": paths["probes"],
+        "results json": paths["results_json"],
+        "final report": paths["report_md"],
+    }
+    missing = [name for name, p in expected.items() if not have(p)]
+    for name, p in expected.items():
+        print(f"    {'ok ' if have(p) else 'MISSING'}  {name}: {p}")
+    if missing:
+        raise SystemExit(f"[verify] expected outputs missing: {missing}")
+    print("\n[verify] git status (V2 files are untracked/new; V1 tracked files unchanged):")
+    subprocess.run(["git", "status", "--porcelain"], cwd=ROOT)
+    subprocess.run(["git", "diff", "--stat"], cwd=ROOT)
     print("\nDONE. Read reports/v2_report.md")
 
 

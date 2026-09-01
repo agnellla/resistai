@@ -170,6 +170,188 @@ def ingest_folder(rows, seen_hashes, name, path, *, label, dataset, generator,
     return n_added
 
 
+def _pixel_hash(pil):
+    """sha256 over the decoded RGB pixels - identifies pixel-identical images
+    that came from an in-memory dataset (no file on disk to hash)."""
+    return hashlib.sha256(pil.convert("RGB").tobytes()).hexdigest()
+
+
+def _load_hf(args):
+    """Open the already-downloaded Tiny-GenImage dataset. Never redownloads:
+    --hf_local_dir uses load_from_disk; otherwise load_dataset hits the local
+    cache (and --offline hard-disables any network call)."""
+    if args.hf_local_dir:
+        from datasets import load_from_disk
+        ds = load_from_disk(args.hf_local_dir)
+        if hasattr(ds, "keys"):                       # DatasetDict
+            ds = ds[args.hf_split] if args.hf_split in ds else ds[next(iter(ds.keys()))]
+        return ds
+    if not args.hf_id:
+        raise SystemExit("--source tiny_genimage needs --hf_id (HF dataset id) or --hf_local_dir")
+    if args.offline:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    from datasets import load_dataset
+    return load_dataset(args.hf_id, split=args.hf_split)
+
+
+def ingest_tiny_genimage(rows, seen_hashes, args, phasher):
+    """
+    Assemble from the already-downloaded Tiny-GenImage HF dataset.
+
+    Uses ACTUAL per-generator availability. Train generators are balanced to
+    min(availability, --ai_per_generator, n_real // n_train_generators); the run
+    FAILS LOUDLY if that floor drops below --min_per_generator instead of
+    silently shipping a thin set. Held-out generators go ONLY into
+    realworld_test. CIFAKE (added later) contributes equally to REAL and AI so it
+    does not affect class balance.
+    """
+    import datasets as _d
+    from PIL import Image
+
+    ds = _load_hf(args)
+    cols = list(ds.column_names)
+
+    # ---- locate the generator + image fields ----
+    gfield = args.generator_field
+    if gfield == "auto":
+        for cand in ("generator", "model", "label", "class", "source", "category", "name", "type"):
+            if cand in cols:
+                gfield = cand
+                break
+        else:
+            raise SystemExit(f"could not auto-detect the generator field in {cols}; "
+                             f"pass --generator_field")
+    if gfield not in cols:
+        raise SystemExit(f"--generator_field {gfield!r} not in dataset columns {cols}")
+    gfeat = ds.features.get(gfield)
+
+    def gen_name(ex):
+        v = ex[gfield]
+        if gfeat is not None and hasattr(gfeat, "int2str") and isinstance(v, int):
+            return gfeat.int2str(v)
+        return str(v)
+
+    ifield = args.image_field
+    if ifield == "auto":
+        for c in cols:
+            if isinstance(ds.features[c], _d.Image):
+                ifield = c
+                break
+        else:
+            raise SystemExit(f"could not auto-detect the image field in {cols}; pass --image_field")
+
+    real_names = {s.strip().lower() for s in args.real_names.split(",") if s.strip()}
+    train_gens = {s.strip() for s in args.train_generators.split(",") if s.strip()}
+    held_gens = {s.strip() for s in args.heldout_generators.split(",") if s.strip()}
+    if not held_gens:
+        raise SystemExit("--heldout_generators must name >= 1 generator (the unseen-generator "
+                         "test is the point of objective C)")
+    if train_gens & held_gens:
+        raise SystemExit(f"generator(s) in BOTH --train_generators and --heldout_generators: "
+                         f"{sorted(train_gens & held_gens)}")
+
+    # ---- pass 1: real availability ----
+    raw_counts = collections.Counter()
+    norm_avail = collections.Counter()
+    for ex in ds:
+        g = gen_name(ex)
+        raw_counts[g] += 1
+        norm_avail["REAL" if g.lower() in real_names else g] += 1
+    print(f"[tiny_genimage] '{gfield}' raw value counts: {dict(raw_counts)}")
+    print(f"[tiny_genimage] normalised availability   : {dict(norm_avail)}")
+
+    if not train_gens:
+        train_gens = {g for g in norm_avail if g != "REAL" and g not in held_gens}
+    missing = sorted(g for g in (train_gens | held_gens) if norm_avail.get(g, 0) == 0)
+    if missing:
+        raise SystemExit(f"[tiny_genimage] requested generator(s) absent from the dataset: "
+                         f"{missing}. Available: {sorted(norm_avail)}. Fix --train_generators / "
+                         f"--heldout_generators.")
+    if "REAL" not in norm_avail:
+        raise SystemExit(f"[tiny_genimage] no REAL images found (real_names={sorted(real_names)}); "
+                         f"pass --real_names matching one of {sorted(norm_avail)}")
+
+    n_train_gens = len(train_gens)
+    raw_per_gen = min(norm_avail[g] for g in train_gens)
+    if args.ai_per_generator:
+        raw_per_gen = min(raw_per_gen, args.ai_per_generator)
+    n_real = min(args.n_real, norm_avail["REAL"])
+    per_gen = raw_per_gen
+    if args.balance_classes:
+        per_gen = min(per_gen, n_real // n_train_gens)
+    if per_gen < args.min_per_generator:
+        raise SystemExit(
+            f"[tiny_genimage] per-train-generator count would be {per_gen} "
+            f"(< --min_per_generator {args.min_per_generator}). "
+            f"availability={{ {', '.join(f'{g}:{norm_avail[g]}' for g in sorted(train_gens))} }}, "
+            f"n_real={n_real}, n_train_generators={n_train_gens}"
+            + (f", class-balance cap = n_real//n_gens = {n_real // n_train_gens}"
+               if args.balance_classes else "") + ". "
+            f"Options: fewer --train_generators, more REAL images, --no_balance_classes, "
+            f"or lower --min_per_generator deliberately. Not building a thin set.")
+
+    caps = {g: per_gen for g in train_gens}
+    for g in held_gens:
+        caps[g] = min(args.heldout_count, norm_avail[g])
+        if caps[g] < args.min_per_generator:
+            raise SystemExit(f"[tiny_genimage] held-out generator {g!r} has only {norm_avail[g]} "
+                             f"images (< --min_per_generator {args.min_per_generator}); cannot run "
+                             f"a defensible unseen-generator test on it.")
+    print(f"[tiny_genimage] PLAN  REAL={n_real}  "
+          f"train={{ {', '.join(f'{g}:{caps[g]}' for g in sorted(train_gens))} }}  "
+          f"heldout={{ {', '.join(f'{g}:{caps[g]}' for g in sorted(held_gens))} }}  "
+          f"(raw_per_gen={raw_per_gen}, class_balanced={args.balance_classes})")
+
+    # ---- pass 2: materialise ----
+    got = collections.Counter()
+    n_dup = 0
+    for i, ex in enumerate(ds):
+        g = gen_name(ex)
+        is_real = g.lower() in real_names
+        key = "REAL" if is_real else g
+        if is_real:
+            if got["REAL"] >= n_real:
+                continue
+            label, gen, src, held, sub = 0, "", "GenImage-real", False, "real"
+        else:
+            if key not in caps or got[key] >= caps[key]:
+                continue
+            held = key in held_gens
+            label, gen, src, sub = 1, key, key, ("heldout_ai" if held else "ai")
+        try:
+            im = ex[ifield]
+            if not hasattr(im, "convert"):
+                im = Image.open(io.BytesIO(im["bytes"])) if isinstance(im, dict) else Image.open(im)
+            im = im.convert("RGB")
+            digest = _pixel_hash(im)
+            if digest in seen_hashes:
+                n_dup += 1
+                continue
+            phash = str(phasher(im)) if phasher else None
+            dst = IMG_ROOT / "tiny_genimage" / sub / f"{key}_{i}_{digest[:12]}.jpg"
+            ow, oh = _save_resized(im, dst, args.max_side)
+        except Exception as e:
+            print(f"    skip row {i} ({key}): {e}")
+            continue
+        seen_hashes.add(digest)
+        rows.append(dict(
+            image_path=str(dst.relative_to(ROOT)), label=label, dataset="tiny_genimage",
+            generator=gen, source=src, orig_w=ow, orig_h=oh, content_hash=digest,
+            group=(phash if phash else digest), held_out=held, is_cifake=False))
+        got[key] += 1
+        if got["REAL"] >= n_real and all(got[k] >= v for k, v in caps.items()):
+            break
+    print(f"[tiny_genimage] collected {dict(got)}  (dup {n_dup})")
+    short = {k: v for k, v in caps.items() if got[k] < v}
+    if got["REAL"] < n_real:
+        short["REAL"] = f"{got['REAL']}/{n_real}"
+    if short:
+        raise SystemExit(f"[tiny_genimage] could not reach the PLAN counts: {short}. "
+                         f"Availability changed under us or the dataset is smaller than its "
+                         f"first pass reported. Not fabricating images.")
+
+
 def ingest_cifake(rows, seen_hashes, args, rng, phasher):
     root = Path(args.cifake_dir)
     real_dir, fake_dir = root / "real", root / "fake"
@@ -292,7 +474,7 @@ def summarise(name, rs):
 def main():
     ap = argparse.ArgumentParser(description="Assemble the ResistAI V2 dataset (objective C)",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--source", default="folders", choices=["folders", "elsa"])
+    ap.add_argument("--source", default="folders", choices=["folders", "elsa", "tiny_genimage"])
     ap.add_argument("--real_dir", action="append", metavar="SRC=PATH",
                     help="a real-photo source -> train/val pool (repeatable)")
     ap.add_argument("--ai_dir", action="append", metavar="GEN=PATH",
@@ -315,13 +497,43 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no_phash", action="store_true",
                     help="disable perceptual-hash near-dup grouping even if imagehash is installed")
+    # generator / class balancing (folders + tiny_genimage)
+    ap.add_argument("--n_real", type=int, default=10000, help="max REAL images (capped by availability)")
+    ap.add_argument("--ai_per_generator", type=int, default=2000,
+                    help="CEILING on images per TRAIN generator; actual = min(this, availability, "
+                         "and n_real//n_train_generators when --balance_classes)")
+    ap.add_argument("--heldout_count", type=int, default=2000,
+                    help="CEILING on images per HELD-OUT generator (capped by availability)")
+    ap.add_argument("--min_per_generator", type=int, default=1000,
+                    help="hard floor: if the balanced per-generator count drops below this the "
+                         "run FAILS LOUDLY instead of shipping a thin dataset")
+    ap.add_argument("--balance_classes", dest="balance_classes", action="store_true", default=True,
+                    help="cap train generators so total train REAL ~= total train AI (default on)")
+    ap.add_argument("--no_balance_classes", dest="balance_classes", action="store_false")
+    ap.add_argument("--balance_train_generators", dest="balance_train_generators",
+                    action="store_true", default=True,
+                    help="(folders mode) downsample each train generator to the smallest one")
+    ap.add_argument("--no_balance_train_generators", dest="balance_train_generators",
+                    action="store_false")
+    # tiny_genimage-only
+    ap.add_argument("--hf_id", default=None, help="HF dataset id for --source tiny_genimage")
+    ap.add_argument("--hf_local_dir", default=None, help="local load_from_disk path (no network)")
+    ap.add_argument("--hf_split", default="train")
+    ap.add_argument("--generator_field", default="auto", help="column naming the generator")
+    ap.add_argument("--image_field", default="auto", help="column holding the image")
+    ap.add_argument("--real_names", default="real,nature,imagenet,photo,authentic",
+                    help="generator-field values (case-insensitive) that mean REAL")
+    ap.add_argument("--train_generators", default="",
+                    help="comma list of TRAIN generators (default: all non-real, non-heldout)")
+    ap.add_argument("--heldout_generators", default="",
+                    help="comma list of HELD-OUT generators -> realworld_test ONLY")
+    ap.add_argument("--offline", dest="offline", action="store_true", default=True,
+                    help="hard-disable HF network; reuse the local cache only (default on)")
+    ap.add_argument("--no_offline", dest="offline", action="store_false")
     # elsa-only
     ap.add_argument("--accept_weak_dataset", action="store_true",
                     help="required to use --source elsa")
     ap.add_argument("--elsa_heldout", default="DeepFloydIF")
-    ap.add_argument("--n_real", type=int, default=10000)
-    ap.add_argument("--ai_per_generator", type=int, default=2000)
-    ap.add_argument("--heldout_count", type=int, default=1500)
     args = ap.parse_args()
 
     if IMG_ROOT.exists() and any(IMG_ROOT.iterdir()):
@@ -343,12 +555,14 @@ def main():
 
     rows, seen = [], set()
 
-    if args.source == "elsa":
+    if args.source == "tiny_genimage":
+        ingest_tiny_genimage(rows, seen, args, phasher)
+    elif args.source == "elsa":
         if not args.accept_weak_dataset:
             raise SystemExit("--source elsa is scientifically weaker for objective C "
                              "(SD-family only, single real source, unverified schema). "
                              "Pass --accept_weak_dataset to proceed anyway, or use "
-                             "--source folders with GenImage-style per-generator dirs.")
+                             "--source folders / --source tiny_genimage.")
         ingest_elsa(rows, seen, args, phasher)
     else:
         real_dirs = _key_val_list(args.real_dir)
@@ -385,6 +599,49 @@ def main():
 
     print("[v2-data] ingesting CIFAKE mix-in (train only)...")
     ingest_cifake(rows, seen, args, rng, phasher)
+
+    # ---- balance the TRAIN pool (generator-level, then class-level) --------
+    # tiny_genimage already balances during ingest; this makes folders mode and
+    # any imbalanced source obey the same rule instead of failing on a count.
+    def _subsample(pred, keep_per_group, key):
+        groups = {}
+        for r in rows:
+            if pred(r):
+                groups.setdefault(key(r), []).append(r)
+        if not groups:
+            return
+        keep = set()
+        for gk, items in groups.items():
+            items = sorted(items, key=lambda r: r["content_hash"])
+            random.Random(f"{args.seed}:{gk}").shuffle(items)
+            for r in items[:keep_per_group.get(gk, len(items))]:
+                keep.add(id(r))
+        before = len(rows)
+        rows[:] = [r for r in rows if not pred(r) or id(r) in keep]
+        print(f"[v2-data] balancing pass dropped {before - len(rows)} row(s); "
+              f"per-group kept={ {k: min(v, keep_per_group.get(k, v)) for k, v in {g: len(i) for g, i in groups.items()}.items()} }")
+
+    train_ai = lambda r: r["label"] == 1 and not r["held_out"] and not r["is_cifake"]
+    gen_counts = collections.Counter(r["generator"] for r in rows if train_ai(r))
+    if gen_counts:
+        n_gens = len(gen_counts)
+        target = min(gen_counts.values())
+        if args.ai_per_generator:
+            target = min(target, args.ai_per_generator)
+        n_real_train = sum(1 for r in rows if r["label"] == 0 and not r["held_out"]
+                           and not r["is_cifake"])
+        if args.balance_classes and n_real_train:
+            target = min(target, n_real_train // n_gens)
+        if target < args.min_per_generator:
+            raise SystemExit(f"[v2-data] per-generator target {target} < --min_per_generator "
+                             f"{args.min_per_generator}. availability={dict(gen_counts)}, "
+                             f"n_real_train={n_real_train}, n_generators={n_gens}, "
+                             f"class-balance cap={n_real_train // n_gens if n_real_train else 'n/a'}. "
+                             f"Options: fewer --ai_dir generators, more REAL, --no_balance_classes, "
+                             f"or lower --min_per_generator deliberately.")
+        if args.balance_train_generators or args.balance_classes:
+            print(f"[v2-data] train-generator availability {dict(gen_counts)} -> balancing all to {target}")
+            _subsample(train_ai, {g: target for g in gen_counts}, lambda r: r["generator"])
 
     # ---- assemble splits ---------------------------------------------------
     held_rows = [r for r in rows if r["held_out"]]
@@ -464,14 +721,36 @@ def main():
     dup_paths = [p for p, n in collections.Counter(
         r["image_path"] for r in train + val + realworld_test).items() if n > 1]
     if dup_paths:                 problems.append(f"{len(dup_paths)} duplicate image_path across manifests")
+    rw_labels = {r["label"] for r in realworld_test}
+    if rw_labels != {0, 1}:
+        problems.append(f"realworld_test must contain BOTH classes, has labels {sorted(rw_labels)}")
+    train_gen_counts = collections.Counter(r["generator"] for r in train if r["label"] == 1)
+    val_gen_counts = collections.Counter(r["generator"] for r in val if r["label"] == 1)
+    # check the assembled pool per generator (train+val), not the post-split train count
+    pool_gen_counts = train_gen_counts + val_gen_counts
+    thin = {g: n for g, n in pool_gen_counts.items()
+            if g and n < args.min_per_generator and g != "SD1.4"}   # SD1.4 = CIFAKE mix-in
+    if thin:
+        problems.append(f"train-pool generator(s) below --min_per_generator "
+                        f"{args.min_per_generator}: {thin}")
+    rw_gen_counts = collections.Counter(r["generator"] for r in realworld_test if r["label"] == 1)
 
     leak = {
         "checked": ["path disjoint", "content-hash disjoint",
                     "held-out generators absent from train+val",
-                    "AI rows have generator labels", "no duplicate paths"],
+                    "AI rows have generator labels", "no duplicate paths",
+                    "realworld_test has both classes",
+                    "train generators >= --min_per_generator"],
         "held_out_generators": held_gen_names,
         "train_generators": sorted(tr_g), "val_generators": sorted(va_g),
+        "train_generator_counts": dict(train_gen_counts),
+        "realworld_test_generator_counts": dict(rw_gen_counts),
+        "realworld_test_real": sum(1 for r in realworld_test if r["label"] == 0),
+        "realworld_test_ai": sum(1 for r in realworld_test if r["label"] == 1),
+        "min_per_generator": args.min_per_generator,
         "n_train": len(train), "n_val": len(val), "n_realworld_test": len(realworld_test),
+        "n_train_real": sum(1 for r in train if r["label"] == 0),
+        "n_train_ai": sum(1 for r in train if r["label"] == 1),
         "near_dup_grouping": "phash" if phasher else "exact-hash only",
         "problems": problems, "ok": not problems,
     }
